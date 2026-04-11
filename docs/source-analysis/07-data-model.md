@@ -1123,53 +1123,225 @@ INSERT INTO event VALUES (
 
 ## 设计问题分析
 
-### 问题一：全局数据库导致数据残留
+### 现有 Project 管理能力
 
-删除项目目录后，数据库数据不会自动清理。
+#### HTTP REST API（已存在）
 
-**解决方案**（手动）：
+**文件**: `src/server/routes/project.ts`
 
-```bash
-# 查看数据库路径
-opencode db path
+| 端点                  | 方法  | 说明            | 实现                |
+| --------------------- | ----- | --------------- | ------------------- |
+| `/project/`           | GET   | 列出所有项目    | `Project.list()`    |
+| `/project/current`    | GET   | 获取当前项目    | `Instance.project`  |
+| `/project/git/init`   | POST  | 初始化 Git 仓库 | `Project.initGit()` |
+| `/project/:projectID` | PATCH | 更新项目属性    | `Project.update()`  |
 
-# 手动删除废弃 Project
-sqlite3 ~/.local/share/opencode/opencode.db
-> DELETE FROM project WHERE worktree LIKE '%/已删除目录';
+**实现代码**：
+
+```typescript
+// src/server/routes/project.ts
+export const ProjectRoutes = lazy(() =>
+  new Hono()
+    .get("/", async (c) => {
+      const projects = Project.list()
+      return c.json(projects)
+    })
+    .get("/current", async (c) => {
+      return c.json(Instance.project)
+    })
+    .post("/git/init", async (c) => {
+      const next = await Project.initGit({ directory, project })
+      await Instance.reload({ directory, worktree, project: next })
+      return c.json(next)
+    })
+    .patch("/:projectID", async (c) => {
+      const project = await Project.update({ projectID, ...body })
+      return c.json(project)
+    }),
+)
 ```
 
-### 问题二：缺少 Project 管理命令
+#### Project 服务方法（已存在）
 
-建议添加：
+**文件**: `src/project/project.ts`
 
-```bash
-opencode project list
-opencode project delete <id>
-opencode project clean  # 自动清理废弃项目
+```typescript
+export interface Interface {
+  readonly fromDirectory: (directory: string) => Effect.Effect<{ project: Info; sandbox: string }>
+  readonly discover: (input: Info) => Effect.Effect<void>
+  readonly list: () => Effect.Effect<Info[]>
+  readonly get: (id: ProjectID) => Effect.Effect<Info | undefined>
+  readonly update: (input: UpdateInput) => Effect.Effect<Info>
+  readonly initGit: (input: { directory: string; project: Info }) => Effect.Effect<Info>
+  readonly setInitialized: (id: ProjectID) => Effect.Effect<void>
+  readonly sandboxes: (id: ProjectID) => Effect.Effect<string[]>
+  readonly addSandbox: (id: ProjectID, directory: string) => Effect.Effect<void>
+  readonly removeSandbox: (id: ProjectID, directory: string) => Effect.Effect<void>
+  // ❌ 缺少: readonly delete: (id: ProjectID) => Effect.Effect<void>
+}
+```
+
+#### CLI 命令（缺失）
+
+**文件**: `src/cli/cmd/` 目录下没有 `project.ts`
+
+现有的 CLI 命令：
+
+- `opencode session list/delete` - Session 管理
+- `opencode agent create/list` - Agent 管理
+- `opencode db path/query/migrate` - 数据库操作
+- ❌ 没有 `opencode project` 命令
+
+### 能力对比表
+
+| 功能         | HTTP API                  | CLI 命令 | 服务方法              |
+| ------------ | ------------------------- | -------- | --------------------- |
+| 列出项目     | ✅ GET /project/          | ❌ 无    | ✅ `list()`           |
+| 获取当前     | ✅ GET /project/current   | ❌ 无    | ✅ `Instance.project` |
+| 更新项目     | ✅ PATCH /project/:id     | ❌ 无    | ✅ `update()`         |
+| 初始化 Git   | ✅ POST /project/git/init | ❌ 无    | ✅ `initGit()`        |
+| 删除项目     | ❌ 无                     | ❌ 无    | ❌ 无                 |
+| 清理废弃     | ❌ 无                     | ❌ 无    | ❌ 无                 |
+| 添加 Sandbox | ❌ 无                     | ❌ 无    | ✅ `addSandbox()`     |
+| 删除 Sandbox | ❌ 无                     | ❌ 无    | ✅ `removeSandbox()`  |
+
+### 问题一：缺少 Project Delete 功能
+
+**现状**：
+
+- 数据库级联删除已配置（`onDelete: "cascade"`）
+- 但没有触发入口：HTTP API、CLI、服务方法都没有
+
+**影响**：
+
+- 删除项目目录后数据残留
+- 用户无法清理废弃项目
+- 数据库持续膨胀
+
+**建议实现**：
+
+```typescript
+// 1. 服务层添加 delete 方法
+// src/project/project.ts
+readonly delete: (id: ProjectID) => Effect.Effect<void>
+
+const delete_ = Effect.fn("Project.delete")(function* (id: ProjectID) {
+  const db = yield* Database.use
+  // 级联删除会自动删除 session → message → part
+  db.delete(ProjectTable).where(eq(ProjectTable.id, id)).run()
+
+  // 发布事件通知前端
+  yield* Bus.publish(Project.Event.Deleted, { id })
+})
+
+// 2. HTTP API 添加 DELETE 路由
+// src/server/routes/project.ts
+.delete("/:projectID", async (c) => {
+  await Project.delete(projectID)
+  return c.json(true)
+})
+
+// 3. CLI 命令
+// src/cli/cmd/project.ts
+export const ProjectCommand = cmd({
+  command: "project",
+  describe: "manage projects",
+  builder: (yargs) => yargs
+    .command(ProjectListCommand)
+    .command(ProjectDeleteCommand)
+    .command(ProjectCleanCommand)
+    .demandCommand(),
+})
+
+const ProjectDeleteCommand = cmd({
+  command: "delete <projectID>",
+  describe: "delete a project and all its data",
+  handler: async (args) => {
+    await Project.delete(args.projectID)
+    console.log(`Project ${args.projectID} deleted`)
+  },
+})
+
+const ProjectCleanCommand = cmd({
+  command: "clean",
+  describe: "clean up projects with deleted directories",
+  handler: async () => {
+    const projects = Project.list()
+    for (const p of projects) {
+      if (!fs.existsSync(p.worktree)) {
+        await Project.delete(p.id)
+        console.log(`Deleted orphan project: ${p.id}`)
+      }
+    }
+  },
+})
+```
+
+### 问题二：缺少自动清理机制
+
+**现状**：启动时不检测项目目录是否存在
+
+**建议改进**：
+
+```typescript
+// src/index.ts 启动时自动清理
+const cleanupOrphanProjects = Effect.fn("cleanupOrphanProjects")(function* () {
+  const projects = yield* Project.list()
+  for (const p of projects) {
+    const exists = yield* fs.exists(p.worktree)
+    if (!exists && p.id !== ProjectID.global) {
+      log.info("cleaning orphan project", { id: p.id, worktree: p.worktree })
+      yield* Project.delete(p.id)
+    }
+  }
+})
 ```
 
 ### 问题三：事件存储可选
 
 `EventTable` 存储受 `OPENCODE_EXPERIMENTAL_WORKSPACES` 特性开关控制。
 
+### 当前手动解决方案
+
+```bash
+# 查看数据库路径
+opencode db path
+# 输出: ~/.local/share/opencode/opencode.db
+
+# 查看 HTTP API（需要服务运行）
+curl http://localhost:4096/project/
+
+# 手动删除废弃 Project
+sqlite3 ~/.local/share/opencode/opencode.db
+> SELECT id, worktree FROM project;
+> DELETE FROM project WHERE worktree LIKE '%/已删除目录';
+# 级联删除会自动清理 session、message、part
+```
+
 ---
 
 ## 参考文件
 
-| 文件                          | 说明                           |
-| ----------------------------- | ------------------------------ |
-| `src/storage/db.ts`           | 数据库初始化、事务管理         |
-| `src/storage/db.bun.ts`       | Bun SQLite 实现                |
-| `src/storage/db.node.ts`      | Node SQLite 实现               |
-| `src/sync/index.ts`           | SyncEvent 事件溯源系统         |
-| `src/sync/event.sql.ts`       | 事件表定义                     |
-| `src/bus/index.ts`            | BusEvent pub/sub 服务          |
-| `src/bus/global.ts`           | GlobalBus 跨实例广播           |
-| `src/server/routes/event.ts`  | SSE 端点实现                   |
-| `src/server/routes/global.ts` | 全局 SSE 端点                  |
-| `src/session/projectors.ts`   | Session/Message/Part Projector |
-| `src/session/index.ts`        | Session 服务                   |
-| `src/session/message-v2.ts`   | Message/Part 定义和事件        |
-| `src/session/prompt.ts`       | SessionPrompt LLM 交互         |
-| `src/session/processor.ts`    | LLM Stream 处理器              |
-| `src/project/project.ts`      | Project 服务                   |
+| 文件                           | 说明                           |
+| ------------------------------ | ------------------------------ |
+| `src/storage/db.ts`            | 数据库初始化、事务管理         |
+| `src/storage/db.bun.ts`        | Bun SQLite 实现                |
+| `src/storage/db.node.ts`       | Node SQLite 实现               |
+| `src/sync/index.ts`            | SyncEvent 事件溯源系统         |
+| `src/sync/event.sql.ts`        | 事件表定义                     |
+| `src/bus/index.ts`             | BusEvent pub/sub 服务          |
+| `src/bus/global.ts`            | GlobalBus 跨实例广播           |
+| `src/server/routes/event.ts`   | SSE 端点实现                   |
+| `src/server/routes/global.ts`  | 全局 SSE 端点                  |
+| `src/server/routes/project.ts` | Project HTTP REST API          |
+| `src/server/instance.ts`       | Instance 路由聚合              |
+| `src/session/projectors.ts`    | Session/Message/Part Projector |
+| `src/session/index.ts`         | Session 服务                   |
+| `src/session/message-v2.ts`    | Message/Part 定义和事件        |
+| `src/session/prompt.ts`        | SessionPrompt LLM 交互         |
+| `src/session/processor.ts`     | LLM Stream 处理器              |
+| `src/project/project.ts`       | Project 服务（缺少 delete）    |
+| `src/project/project.sql.ts`   | Project 数据库表               |
+| `src/project/instance.ts`      | Instance ALS 上下文            |
+| `src/cli/cmd/session.ts`       | Session CLI 命令               |
+| `src/cli/cmd/db.ts`            | 数据库 CLI 命令                |
