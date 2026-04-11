@@ -13,6 +13,7 @@
 7. [权限控制](#权限控制)
 8. [CLI 命令](#cli-命令)
 9. [配置方式](#配置方式)
+10. [核心数据模型关系](#核心数据模型关系)
 
 ---
 
@@ -827,6 +828,441 @@ model: anthropic/claude-haiku-3.5
 ---
 
 You are a specialized agent. Your instructions...
+```
+
+---
+
+## 核心数据模型关系
+
+OpenCode 的数据模型采用四层层级结构：Project → Session → Message → Part。
+
+### 层级关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Project (项目)                                                           │
+│ - 代表一个 Git Worktree 或非 Git 目录                                     │
+│ - ID 基于 Git 仓库首个 commit hash                                       │
+│ - 一个 Project 可包含多个 Sandbox（工作目录）                              │
+└─────────────────────────────────────────────────────────────────────────┘
+                    │ 1:N
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Session (会话)                                                           │
+│ - 代表一次对话                                                            │
+│ - 关联到 Project 和具体工作目录                                            │
+│ - 可有 parentID 形成父子关系（子 Agent 会话）                              │
+└─────────────────────────────────────────────────────────────────────────┘
+                    │ 1:N
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Message (消息)                                                           │
+│ - Session 中的一条消息（user 或 assistant）                               │
+│ - 包含时间戳、错误信息、模型信息等元数据                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+                    │ 1:N
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Part (内容片段)                                                           │
+│ - Message 中的一个内容单元                                                 │
+│ - 类型包括：text, file, tool, reasoning, snapshot, patch 等              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 数据模型定义
+
+#### Project 数据结构
+
+```typescript
+// src/project/project.ts
+export const Info = z.object({
+  id: ProjectID.zod, // 项目唯一标识（基于 git 首个 commit hash）
+  worktree: z.string(), // Git Worktree 根目录
+  vcs: z.literal("git").optional(), // 版本控制系统类型
+  name: z.string().optional(), // 项目名称
+  icon: z
+    .object({
+      // 项目图标
+      url: z.string().optional(),
+      color: z.string().optional(),
+    })
+    .optional(),
+  commands: z
+    .object({
+      // 项目命令
+      start: z.string().optional(), // 启动脚本
+    })
+    .optional(),
+  time: z.object({
+    created: z.number(),
+    updated: z.number(),
+    initialized: z.number().optional(),
+  }),
+  sandboxes: z.array(z.string()), // 属于此 Project 的所有工作目录列表
+})
+```
+
+**数据库表**（`src/project/project.sql.ts`）：
+
+```typescript
+export const ProjectTable = sqliteTable("project", {
+  id: text().$type<ProjectID>().primaryKey(),
+  worktree: text().notNull(),
+  vcs: text(),
+  name: text(),
+  icon_url: text(),
+  icon_color: text(),
+  time_created: integer(),
+  time_updated: integer(),
+  time_initialized: integer(),
+  sandboxes: text({ mode: "json" }).notNull().$type<string[]>(),
+  commands: text({ mode: "json" }).$type<{ start?: string }>(),
+})
+```
+
+#### Session 数据结构
+
+```typescript
+// src/session/index.ts
+export const Info = z.object({
+  id: SessionID.zod,
+  slug: z.string(), // URL 友好的短标识
+  projectID: ProjectID.zod, // 关联 Project
+  workspaceID: WorkspaceID.zod.optional(), // Workspace ID（可选）
+  directory: z.string(), // 当前工作目录
+  parentID: SessionID.zod.optional(), // 父 Session（子 Agent 用）
+  title: z.string(), // 会话标题
+  version: z.string(), // OpenCode 版本
+  summary: z
+    .object({
+      // 代码变更摘要
+      additions: z.number(),
+      deletions: z.number(),
+      files: z.number(),
+      diffs: Snapshot.FileDiff.array().optional(),
+    })
+    .optional(),
+  share: z.object({ url: z.string() }).optional(), // 分享链接
+  revert: z
+    .object({
+      // 回滚信息
+      messageID: MessageID.zod,
+      partID: PartID.zod.optional(),
+      snapshot: z.string().optional(),
+      diff: z.string().optional(),
+    })
+    .optional(),
+  permission: Permission.Ruleset.optional(), // 权限规则
+  time: z.object({
+    created: z.number(),
+    updated: z.number(),
+    compacting: z.number().optional(),
+    archived: z.number().optional(),
+  }),
+})
+```
+
+**数据库表**（`src/session/session.sql.ts`）：
+
+```typescript
+export const SessionTable = sqliteTable("session", {
+  id: text().$type<SessionID>().primaryKey(),
+  project_id: text()
+    .$type<ProjectID>()
+    .notNull()
+    .references(() => ProjectTable.id, { onDelete: "cascade" }),
+  workspace_id: text().$type<WorkspaceID>(),
+  parent_id: text().$type<SessionID>(),
+  slug: text().notNull(),
+  directory: text().notNull(),
+  title: text().notNull(),
+  version: text().notNull(),
+  share_url: text(),
+  summary_additions: integer(),
+  summary_deletions: integer(),
+  summary_files: integer(),
+  permission: text({ mode: "json" }).$type<Permission.Ruleset>(),
+  time_created: integer(),
+  time_updated: integer(),
+  time_compacting: integer(),
+  time_archived: integer(),
+})
+```
+
+#### Message 数据结构
+
+```typescript
+// src/session/message-v2.ts
+export const User = z
+  .object({
+    id: MessageID.zod,
+    sessionID: SessionID.zod,
+    role: z.literal("user"),
+    error: z.any().optional(),
+    time: z.object({ created: z.number() }),
+  })
+  .meta({ ref: "MessageUser" })
+
+export const Assistant = z
+  .object({
+    id: MessageID.zod,
+    sessionID: SessionID.zod,
+    role: z.literal("assistant"),
+    parentID: MessageID.zod.optional(), // 关联的 user 消息
+    modelID: ModelID.zod.optional(),
+    providerID: ProviderID.zod.optional(),
+    error: APIError.Schema.optional(),
+    time: z.object({
+      created: z.number(),
+      updated: z.number().optional(),
+    }),
+  })
+  .meta({ ref: "MessageAssistant" })
+```
+
+**数据库表**：
+
+```typescript
+export const MessageTable = sqliteTable("message", {
+  id: text().$type<MessageID>().primaryKey(),
+  session_id: text()
+    .$type<SessionID>()
+    .notNull()
+    .references(() => SessionTable.id, { onDelete: "cascade" }),
+  time_created: integer(),
+  time_updated: integer(),
+  data: text({ mode: "json" }).notNull().$type<InfoData>(),
+})
+```
+
+#### Part 数据结构
+
+```typescript
+// src/session/message-v2.ts
+const PartBase = z.object({
+  id: PartID.zod,
+  sessionID: SessionID.zod,
+  messageID: MessageID.zod,
+})
+
+// Part 类型（部分示例）
+export const TextPart = PartBase.extend({
+  type: z.literal("text"),
+  text: z.string(),
+})
+
+export const ToolPart = PartBase.extend({
+  type: z.literal("tool"),
+  callID: z.string(),
+  tool: z.string(),
+  state: ToolState, // pending | running | completed | error
+})
+
+export const FilePart = PartBase.extend({
+  type: z.literal("file"),
+  mime: z.string(),
+  url: z.string(),
+  filename: z.string().optional(),
+})
+
+export const ReasoningPart = PartBase.extend({
+  type: z.literal("reasoning"),
+  text: z.string(),
+})
+
+// ... 还有 snapshot, patch, agent, compaction 等类型
+```
+
+**数据库表**：
+
+```typescript
+export const PartTable = sqliteTable("part", {
+  id: text().$type<PartID>().primaryKey(),
+  message_id: text()
+    .$type<MessageID>()
+    .notNull()
+    .references(() => MessageTable.id, { onDelete: "cascade" }),
+  session_id: text().$type<SessionID>().notNull(),
+  time_created: integer(),
+  time_updated: integer(),
+  data: text({ mode: "json" }).notNull().$type<PartData>(),
+})
+```
+
+### Project 创建多个的场景
+
+#### 场景一：Git Worktree
+
+**核心概念**：Git Worktree 允许一个 Git 仓库在多个目录同时检出不同分支。
+
+```
+Git Repository (共享 .git 目录)
+    │
+    ├── worktree/           ← 主工作目录（Project.worktree）
+    │   └── .git            ← Git 目录
+    │
+    ├── sandbox-1/          ← Git Worktree 1（Project.sandboxes[0]）
+    │   └── .git (文件，指向主 .git)
+    │
+    └── sandbox-2/          ← Git Worktree 2（Project.sandboxes[1]）
+        └── .git (文件，指向主 .git)
+```
+
+**Project ID 生成逻辑**（`src/project/project.ts`）：
+
+```typescript
+// ProjectID 基于 Git 仓库的首个 commit hash
+const revList = yield * git(["rev-list", "--max-parents=0", "HEAD"], { cwd: sandbox })
+const roots = revList.text
+  .split("\n")
+  .filter(Boolean)
+  .map((x) => x.trim())
+  .toSorted()
+id = roots[0] ? ProjectID.make(roots[0]) : undefined
+
+// 缓存 ProjectID 到 .git/opencode 文件
+if (id) {
+  yield * fs.writeFileString(path.join(worktree, ".git", "opencode"), id)
+}
+```
+
+**关键点**：
+
+- 同一个 Git 仓库的所有 Worktree 共享同一个 ProjectID
+- Project.sandboxes 记录所有属于此 Project 的工作目录
+- 打开不同 Worktree 目录时，Session 属于同一个 Project
+
+#### 场景二：多个独立 Git 仓库
+
+每个独立的 Git 仓库有独立的历史，因此会创建不同的 Project：
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ Project A       │     │ Project B       │     │ Project C       │
+│ (repo-a.git)    │     │ (repo-b.git)    │     │ (repo-c.git)    │
+│                 │     │                 │     │                 │
+│ ├── worktree/   │     │ ├── worktree/   │     │ ├── worktree/   │
+│ └── sandbox/    │     │                 │     │                 │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+        │                       │                       │
+        ▼                       ▼                       ▼
+  Session 1...N           Session 1...M           Session 1...K
+```
+
+**触发方式**：
+
+- 用户在不同 Git 仓库目录启动 OpenCode
+- 每个 Git 仓库生成独立的 ProjectID
+
+#### 场景三：非 Git 目录（全局 Project）
+
+当目录不在 Git 仓库内时，会创建一个"全局 Project"：
+
+```typescript
+// src/project/project.ts
+if (!dotgit) {
+  return {
+    id: ProjectID.global, // 全局 Project ID
+    worktree: "/",
+    sandbox: "/",
+    vcs: fakeVcs,
+  }
+}
+```
+
+**特点**：
+
+- 所有非 Git 目录的 Session 都关联到同一个全局 Project
+- worktree 和 sandbox 都设置为 "/"
+- 不支持 Worktree 功能
+
+### Session 创建流程
+
+当用户打开一个工程时的完整流程：
+
+```
+用户打开目录 /path/to/project
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Instance.provide({ directory })                           │
+│    - 创建/获取 Instance 上下文                                │
+│    - 通过 ALS (AsyncLocalStorage) 管理                       │
+└─────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Project.fromDirectory(directory)                          │
+│    - 查找 .git 目录                                           │
+│    - 解析 Git Worktree 信息                                   │
+│    - 生成/缓存 ProjectID                                      │
+│    - Upsert Project 到数据库                                  │
+│    - 返回 { project, sandbox }                                │
+└─────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Session.create()                                          │
+│    - 创建新 Session                                           │
+│    - 关联 projectID 和 directory                              │
+│    - 设置默认标题                                              │
+│    - 存储到数据库                                              │
+└─────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Message 创建（用户输入）                                    │
+│    - 创建 User Message                                        │
+│    - 添加 TextPart/FilPart 等                                 │
+└─────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Assistant Message 创建（LLM 响应）                         │
+│    - 创建 Assistant Message                                   │
+│    - 流式添加 TextPart, ToolPart, ReasoningPart 等            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键理解**：
+
+| 问题                            | 答案                                                               |
+| ------------------------------- | ------------------------------------------------------------------ |
+| 打开工程是否直接创建会话？      | 是，创建 Session 是用户交互的第一步，但 Session 必须关联到 Project |
+| Project 何时创建？              | 打开目录时自动检测并创建/更新 Project                              |
+| 一个 Project 对应多个 Session？ | 是，同一 Project 下可以有多个 Session                              |
+| 一个 Project 对应多个目录？     | 是，Git Worktree 场景下，Project.sandboxes 记录多个目录            |
+| 多个 Project 何时出现？         | 用户在不同 Git 仓库目录工作，每个仓库一个 Project                  |
+
+### Instance 与 Project 的区别
+
+**Instance**：运行时上下文，通过 AsyncLocalStorage 管理：
+
+```typescript
+// src/project/instance.ts
+export interface InstanceContext {
+  directory: string // 当前工作目录
+  worktree: string // Git Worktree 根目录
+  project: Project.Info // 关联的 Project 信息
+}
+```
+
+**Instance 作用**：
+
+- 提供 ALS 上下文，让代码可以访问当前目录和 Project
+- 每个打开的目录对应一个 Instance
+- Instance 是运行时概念，Project 是持久化概念
+
+**关系图**：
+
+```
+┌─────────────────────────────────────────┐
+│ Instance (运行时 ALS 上下文)              │
+│                                         │
+│  directory ──────► 当前工作目录           │
+│  worktree  ──────► Git Worktree 根目录   │
+│  project   ──────► Project.Info (持久化) │
+└─────────────────────────────────────────┘
 ```
 
 ---
