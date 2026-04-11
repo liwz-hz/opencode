@@ -8,10 +8,11 @@
 2. [Agent 类型系统](#agent-类型系统)
 3. [内置 Agents](#内置-agents)
 4. [自定义 Agents](#自定义-agents)
-5. [开放接口](#开放接口)
-6. [权限控制](#权限控制)
-7. [CLI 命令](#cli-命令)
-8. [配置方式](#配置方式)
+5. [Agent 自动生成功能](#agent-自动生成功能)
+6. [开放接口](#开放接口)
+7. [权限控制](#权限控制)
+8. [CLI 命令](#cli-命令)
+9. [配置方式](#配置方式)
 
 ---
 
@@ -378,29 +379,250 @@ const Agent = z.object({
 })
 ```
 
-### Agent 生成流程
+### Agent 自动生成功能
 
-通过 `Agent.generate()` 使用 LLM 自动生成 Agent 配置：
+OpenCode 提供了 LLM 驱动的 Agent 自动生成功能，用户只需提供描述，系统会自动生成完整的 Agent 配置。
+
+#### 使用方式一：CLI 命令
+
+```bash
+# 交互式创建（自动调用 LLM 生成）
+opencode agent create
+
+# 非交互式创建（指定描述，自动生成）
+opencode agent create --description "Review code for security vulnerabilities"
+
+# 完整参数示例
+opencode agent create \
+  --description "Analyze database schema and suggest optimizations" \
+  --mode subagent \
+  --tools read,grep,glob \
+  --model anthropic/claude-sonnet-4 \
+  --path ./custom-agents
+```
+
+**CLI 交互流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 用户输入描述                                              │
+│    "Review code for security vulnerabilities"                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. 系统调用 Agent.generate()                                 │
+│    - 使用 generate.txt 作为 System Prompt                    │
+│    - 调用默认模型或用户指定模型                               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. LLM 返回生成结果                                          │
+│    {                                                         │
+│      identifier: "security-reviewer",                        │
+│      whenToUse: "Use this agent when you need to...",        │
+│      systemPrompt: "You are a security code reviewer..."     │
+│    }                                                         │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. 用户选择工具、模式                                         │
+│    - 选择启用的工具（多选）                                   │
+│    - 选择 Agent 模式（all/primary/subagent）                  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. 生成 .md 文件                                             │
+│    保存到 .opencode/agent/security-reviewer.md               │
+│    或 ~/.config/opencode/agent/security-reviewer.md          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 使用方式二：API 调用
 
 ```typescript
 // src/agent/agent.ts
-export async function generate(input: { description: string; model?: { providerID: ProviderID; modelID: ModelID } }) {
-  // 使用 LLM 生成 Agent 配置
-  // 输出格式：
-  // {
-  //   identifier: "security-reviewer",
-  //   whenToUse: "Use this agent when...",
-  //   systemPrompt: "You are..."
-  // }
+import { Agent } from "@/agent/agent"
+
+// 基本调用
+const result = await Agent.generate({
+  description: "Review code for security vulnerabilities",
+})
+
+// 指定模型
+const result = await Agent.generate({
+  description: "Analyze database schema and suggest optimizations",
+  model: {
+    providerID: "anthropic",
+    modelID: "claude-sonnet-4",
+  },
+})
+
+// 返回结果
+console.log(result)
+// {
+//   identifier: "security-reviewer",
+//   whenToUse: "Use this agent when you need to review code for security vulnerabilities. Examples: ...",
+//   systemPrompt: "You are a security code reviewer specializing in..."
+// }
+```
+
+#### 生成输出格式
+
+LLM 返回的 JSON 结构：
+
+```typescript
+{
+  // Agent 唯一标识符
+  // 规则：小写字母、数字、连字符，2-4 个单词
+  identifier: "security-reviewer",
+
+  // 使用场景描述（包含触发示例）
+  // 格式：以 "Use this agent when..." 开头
+  whenToUse: "Use this agent when you need to review code for security vulnerabilities.\n\nExamples:\n- When user asks 'Review this code for security issues'\n- After implementing authentication logic\n- When adding new API endpoints",
+
+  // 完整的 System Prompt
+  // 格式：第二人称（"You are..."）
+  systemPrompt: "You are a security code reviewer specializing in identifying vulnerabilities..."
 }
 ```
 
-**生成 Prompt**（`src/agent/generate.txt`）：
+#### LLM 生成 Prompt 模板
 
-- 提取核心意图
-- 设计专家角色
-- 构建系统指令
-- 创建唯一标识符
+`src/agent/generate.txt` 定义了 Agent 生成的指导规则：
+
+```
+You are an elite AI agent architect specializing in crafting high-performance agent configurations.
+
+When a user describes what they want an agent to do, you will:
+
+1. **Extract Core Intent**: Identify the fundamental purpose, key responsibilities,
+   and success criteria for the agent.
+
+2. **Design Expert Persona**: Create a compelling expert identity that embodies deep
+   domain knowledge relevant to the task.
+
+3. **Architect Comprehensive Instructions**: Develop a system prompt that:
+   - Establishes clear behavioral boundaries and operational parameters
+   - Provides specific methodologies and best practices for task execution
+   - Anticipates edge cases and provides guidance for handling them
+   - Incorporates any specific requirements or preferences mentioned by the user
+   - Defines output format expectations when relevant
+
+4. **Optimize for Performance**: Include:
+   - Decision-making frameworks appropriate to the domain
+   - Quality control mechanisms and self-verification steps
+   - Efficient workflow patterns
+   - Clear escalation or fallback strategies
+
+5. **Create Identifier**: Design a concise, descriptive identifier that:
+   - Uses lowercase letters, numbers, and hyphens only
+   - Is typically 2-4 words joined by hyphens
+   - Clearly indicates the agent's primary function
+   - Is memorable and easy to type
+
+6. **Example Usage**: Include examples of when this agent should be used:
+   - Context: The scenario where this agent is useful
+   - User message example
+   - Assistant action example (calling the Task tool)
+
+Your output must be a valid JSON object with exactly these fields:
+{
+  "identifier": "...",
+  "whenToUse": "...",
+  "systemPrompt": "..."
+}
+```
+
+#### 生成的 Agent 文件示例
+
+保存的 `.md` 文件格式：
+
+```markdown
+---
+description: Use this agent when you need to review code for security vulnerabilities
+mode: subagent
+tools:
+  bash: false
+  write: false
+  edit: false
+model: anthropic/claude-sonnet-4
+---
+
+You are a security code reviewer specializing in identifying vulnerabilities.
+
+Your responsibilities:
+
+- Identify potential security vulnerabilities (SQL injection, XSS, CSRF, etc.)
+- Check authentication and authorization logic
+- Review input validation and sanitization
+- Analyze data exposure risks
+- Suggest remediation strategies with specific code examples
+
+Approach:
+
+1. First, identify the code's purpose and entry points
+2. Map data flow from user input to sensitive operations
+3. Check each entry point for common vulnerability patterns
+4. Verify proper error handling doesn't expose sensitive info
+5. Provide actionable recommendations with code examples
+
+Output format:
+
+- List identified issues with severity (Critical/High/Medium/Low)
+- Provide specific code location references
+- Suggest remediation code snippets
+- Summarize overall security posture
+```
+
+#### 生成流程技术实现
+
+```typescript
+// src/agent/agent.ts Agent.generate 实现
+generate: Effect.fn("Agent.generate")(function* (input) {
+  const cfg = yield* config.get()
+  const model = input.model ?? (yield* provider.defaultModel())
+  const resolved = yield* provider.getModel(model.providerID, model.modelID)
+  const language = yield* provider.getLanguage(resolved)
+
+  // 构建 System Prompt
+  const system = [PROMPT_GENERATE] // generate.txt
+
+  // 获取现有 Agent 列表（避免标识符冲突）
+  const existing = yield* InstanceState.useEffect(state, (s) => s.list())
+
+  // 构建用户消息
+  const userMessage = `Create an agent configuration based on this request: 
+    "${input.description}".
+    
+    IMPORTANT: The following identifiers already exist and must NOT be used: 
+    ${existing.map((i) => i.name).join(", ")}
+    
+    Return ONLY the JSON object, no other text.`
+
+  // 调用 LLM
+  const result = yield* Effect.promise(() =>
+    generateObject({
+      model: language,
+      temperature: 0.3,
+      messages: [
+        { role: "system", content: system.join("\n") },
+        { role: "user", content: userMessage },
+      ],
+      schema: z.object({
+        identifier: z.string(),
+        whenToUse: z.string(),
+        systemPrompt: z.string(),
+      }),
+    }).then((r) => r.object),
+  )
+
+  return result
+})
+```
 
 ---
 
